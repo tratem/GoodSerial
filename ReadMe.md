@@ -1,0 +1,1 @@
+Use the .exe file for this terminal.
