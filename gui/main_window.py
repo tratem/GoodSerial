@@ -141,8 +141,18 @@ class WindowPanel(QFrame):
         # Panel Title
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet("font-weight: bold; font-size: 15px; color: #2f3640; border: none;")
-        layout.addWidget(self.title_label)
-        
+        layout.addWidget(self.title_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # Connection status (port, baud rate, connected, logging)
+        self.port = None
+        self.baud_rate = None
+        self.connected = False
+        self.logging = False
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("font-size: 12px; color: #636e72; border: none;")
+        layout.addWidget(self.status_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._update_status_label()
+
         self.terminal_output = QPlainTextEdit()
         self.terminal_output.setReadOnly(True)
         layout.addWidget(self.terminal_output)
@@ -152,6 +162,20 @@ class WindowPanel(QFrame):
         
     def get_window_title(self):
         return self.title_label.text()
+
+    def set_connection_info(self, port=None, baud_rate=None, connected=False, logging=False):
+        self.port = port
+        self.baud_rate = baud_rate
+        self.connected = connected
+        self.logging = logging
+        self._update_status_label()
+
+    def _update_status_label(self):
+        port = self.port or "No port"
+        baud = f"{self.baud_rate} baud" if self.baud_rate else "- baud"
+        state = "Connected" if self.connected else "Disconnected"
+        log = "Logging" if self.logging else "Not logging"
+        self.status_label.setText(f"{port}  |  {baud}  |  {state}  |  {log}")
     
     def set_window_background_color(self, background_color):
         self.setStyleSheet(f"""
