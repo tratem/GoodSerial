@@ -1,10 +1,18 @@
-from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, 
-                             QMenuBar, QFrame, QLabel, QSplitter, QPlainTextEdit)
+from datetime import datetime
+
+from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QSizePolicy,
+                             QMenuBar, QFrame, QLabel, QSplitter, QPlainTextEdit, QMenu,
+                             QPushButton, QMessageBox)
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QTextCursor
+from PyQt6.QtSerialPort import QSerialPort
 
 from CustomWidgets.custom_widgets import *
 from gui.help_dialog import HelpDialog
 from gui.preferences_dialog import PreferencesDialog
+from gui.serial_dialog import (SerialPropertiesDialog, default_serial_config,
+                               DATA_BITS, PARITY, STOP_BITS, FLOW_CONTROL)
+from gui.logging_dialog import LoggingConfigDialog, default_logging_config
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -27,13 +35,8 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(self.splitter)
 
-        # Window 1 (Always active)
-        self.window1 = WindowPanel("Terminal", "#f5f6fa")
-        self.splitter.addWidget(self.window1)
-
-        # References for Window 2 and Window 3 (initially None)
-        self.window2 = None
-        self.window3 = None
+        self.panels = []
+        self._add_panel()
 
         # --- Add Terminal Button ---
         self.add_window_button = CustomButton("+")
@@ -87,28 +90,32 @@ class MainWindow(QMainWindow):
 
         self.setMenuBar(menu_bar)
         
-    def _add_terminal_window(self):
-        terminal_window = WindowPanel("Terminal", "#f5f6fa")
-        terminal_window.delete_requested.connect(lambda title: self._remove_terminal_window(title))
-        if self.window2 is None:
-            self.window2 = terminal_window
-            self.splitter.addWidget(self.window2)
-            
-        elif self.window3 is None:
-            self.window3 = terminal_window
-            self.splitter.addWidget(terminal_window)
-            
-            self.add_window_button.hide()
+    MAX_PANELS = 3
 
-    def _remove_terminal_window(self, title):
-        if self.window2 and self.window2.get_window_title() == title:
-            self.splitter.widget(self.splitter.indexOf(self.window2)).setParent(None)
-            self.window2 = None
-        elif self.window3 and self.window3.get_window_title() == title:
-            self.splitter.widget(self.splitter.indexOf(self.window3)).setParent(None)
-            self.window3 = None
-        self.add_window_button.show()
-            
+    PANEL_COLORS = ["#f5f6fa", "#e8f4fd", "#fdf2e3", "#eaf7ea"]
+
+    def _add_panel(self):
+        # Pick the first color not used by an open panel
+        used = {p.background_color for p in self.panels}
+        color = next((c for c in self.PANEL_COLORS if c not in used), self.PANEL_COLORS[0])
+        panel = WindowPanel("Terminal", color)
+        panel.delete_requested.connect(self._remove_terminal_window)
+        self.panels.append(panel)
+        self.splitter.addWidget(panel)
+
+    def _add_terminal_window(self):
+        if len(self.panels) < self.MAX_PANELS:
+            self._add_panel()
+        self.add_window_button.setVisible(len(self.panels) < self.MAX_PANELS)
+
+    def _remove_terminal_window(self, panel):
+        if panel in self.panels:
+            self.panels.remove(panel)
+            panel.shutdown()
+            panel.setParent(None)
+            panel.deleteLater()
+        self.add_window_button.setVisible(len(self.panels) < self.MAX_PANELS)
+
     def _show_preferences(self):
         '''Show preferences dialog or message box'''
         settings_dialog = PreferencesDialog(self)
@@ -121,12 +128,14 @@ class MainWindow(QMainWindow):
     
     def closeEvent(self, event):
         '''Handle any cleanup before the window is closed'''
+        for panel in self.panels:
+            panel.shutdown()
         event.accept()
-        
+
 class WindowPanel(QFrame):
     """A custom widget representing one of the windows/panels."""
-    delete_requested = pyqtSignal(str)  # Signal emitted when the delete button is clicked
-    
+    delete_requested = pyqtSignal(object)  # Emitted with this panel when its close button is clicked
+
     def __init__(self, title, background_color):
         super().__init__()
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -136,12 +145,35 @@ class WindowPanel(QFrame):
             border-radius: 6px;
         """)
         
+        self.default_title = title
+        self.background_color = background_color
+        self.serial_config = default_serial_config()
+        self.logging_config = default_logging_config()
+        self.serial = QSerialPort(self)
+        self.serial.readyRead.connect(self._on_ready_read)
+        self.serial.errorOccurred.connect(self._on_serial_error)
+        self._log_file = None
+        self._log_buffer = ""
+
         layout = QVBoxLayout(self)
-        
-        # Panel Title
+
+        # Panel title with close button
+        header = QHBoxLayout()
+        header.addSpacing(24)
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet("font-weight: bold; font-size: 15px; color: #2f3640; border: none;")
-        layout.addWidget(self.title_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        header.addWidget(self.title_label, 1, Qt.AlignmentFlag.AlignCenter)
+        self.close_button = QPushButton("✕")
+        self.close_button.setFixedSize(24, 24)
+        self.close_button.setToolTip("Close terminal")
+        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_button.setStyleSheet("""
+            QPushButton { border: none; background: transparent; color: #636e72; font-size: 14px; }
+            QPushButton:hover { background: #e84118; color: white; border-radius: 4px; }
+        """)
+        self.close_button.clicked.connect(lambda: self.delete_requested.emit(self))
+        header.addWidget(self.close_button)
+        layout.addLayout(header)
 
         # Connection status (port, baud rate, connected, logging)
         self.port = None
@@ -155,8 +187,144 @@ class WindowPanel(QFrame):
 
         self.terminal_output = QPlainTextEdit()
         self.terminal_output.setReadOnly(True)
+        # Let right clicks reach the panel's own context menu
+        self.terminal_output.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         layout.addWidget(self.terminal_output)
-    
+
+    # ---- context menu ----
+    def contextMenuEvent(self, event):
+        menu = QMenu(self.window())
+        menu.setStyleSheet("""
+            QMenu { background-color: #F7F7F7; border: 1px solid #b2bec3; }
+            QMenu::item { padding: 4px 24px; color: black; }
+            QMenu::item:selected { background: #D6EAF8; }
+            QMenu::separator { height: 1px; background: #b2bec3; margin: 4px 0; }
+        """)
+        if self.connected:
+            menu.addAction("Disconnect").triggered.connect(self.disconnect_port)
+        else:
+            menu.addAction("Connect").triggered.connect(self.connect_port)
+        menu.addAction("Reconnect").triggered.connect(self.reconnect_port)
+        menu.addSeparator()
+        menu.addAction("Clear window").triggered.connect(self.clear_window)
+        menu.addSeparator()
+        menu.addAction("Logging...").triggered.connect(self.show_logging_config)
+        menu.addSeparator()
+        menu.addAction("Properties...").triggered.connect(self.show_properties)
+        menu.exec(event.globalPos())
+
+    # ---- actions ----
+    def connect_port(self):
+        if self.connected:
+            return
+        # Not configured yet: ask for the port settings first
+        if not self.serial_config["port"] and not self.show_properties(reconnect=False):
+            return
+        cfg = self.serial_config
+        self.serial.setPortName(cfg["port"])
+        self.serial.setBaudRate(cfg["baud"])
+        self.serial.setDataBits(DATA_BITS[cfg["data_bits"]])
+        self.serial.setParity(PARITY[cfg["parity"]])
+        self.serial.setStopBits(STOP_BITS[cfg["stop_bits"]])
+        self.serial.setFlowControl(FLOW_CONTROL[cfg["flow"]])
+        if self.serial.open(QSerialPort.OpenModeFlag.ReadWrite):
+            self.connected = True
+            self._append_system(f"Connected to {cfg['port']} @ {cfg['baud']} baud")
+        else:
+            QMessageBox.warning(self.window(), "Connection failed",
+                                f"Could not open {cfg['port']}:\n{self.serial.errorString()}")
+        self._refresh_status()
+
+    def disconnect_port(self):
+        was_connected = self.connected
+        if self.serial.isOpen():
+            self.serial.close()
+        self.connected = False
+        if was_connected:
+            self._append_system(f"Disconnected from {self.serial_config['port']}")
+        self._refresh_status()
+
+    def reconnect_port(self):
+        self.disconnect_port()
+        self.connect_port()
+
+    def clear_window(self):
+        self.terminal_output.clear()
+
+    def show_properties(self, reconnect=True):
+        """Open the serial properties dialog. Returns True if accepted."""
+        dialog = SerialPropertiesDialog(self.serial_config, self.window())
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return False
+        self.serial_config = dialog.get_config()
+        if reconnect and self.connected:
+            self.reconnect_port()
+        else:
+            self._refresh_status()
+        return True
+
+    def show_logging_config(self):
+        dialog = LoggingConfigDialog(self.logging_config, self.window())
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        self.logging_config = dialog.get_config()
+        self._close_log()
+        if self.logging_config["enabled"]:
+            self._open_log()
+        self._refresh_status()
+
+    # ---- serial / logging internals ----
+    def _on_ready_read(self):
+        text = bytes(self.serial.readAll()).decode("utf-8", errors="replace")
+        self.terminal_output.moveCursor(QTextCursor.MoveOperation.End)
+        self.terminal_output.insertPlainText(text.replace("\r\n", "\n").replace("\r", "\n"))
+        self.terminal_output.ensureCursorVisible()
+        if self._log_file:
+            self._log_text(text)
+
+    def _on_serial_error(self, error):
+        if error == QSerialPort.SerialPortError.ResourceError:  # device unplugged
+            self.disconnect_port()
+            self._append_system("Connection lost")
+
+    def _append_system(self, message):
+        self.terminal_output.appendPlainText(f"[{message}]")
+
+    def _open_log(self):
+        try:
+            self._log_file = open(self.logging_config["file"],
+                                  "a" if self.logging_config["append"] else "w", encoding="utf-8")
+        except OSError as e:
+            self._log_file = None
+            QMessageBox.warning(self.window(), "Logging failed", f"Could not open log file:\n{e}")
+
+    def _close_log(self):
+        if self._log_file:
+            self._log_file.close()
+        self._log_file = None
+        self._log_buffer = ""
+
+    def _log_text(self, text):
+        if not self.logging_config["timestamp"]:
+            self._log_file.write(text)
+        else:
+            self._log_buffer += text.replace("\r\n", "\n").replace("\r", "\n")
+            *lines, self._log_buffer = self._log_buffer.split("\n")
+            for line in lines:
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                self._log_file.write(f"[{stamp}] {line}\n")
+        self._log_file.flush()
+
+    def shutdown(self):
+        self.disconnect_port()
+        self._close_log()
+
+    def _refresh_status(self):
+        cfg = self.serial_config
+        self.set_window_title(cfg["alias"] or self.default_title)
+        self.set_connection_info(cfg["port"], cfg["baud"] if cfg["port"] else None,
+                                 self.connected, self._log_file is not None)
+
     def set_window_title(self, title):
         self.title_label.setText(title)
         
@@ -178,6 +346,7 @@ class WindowPanel(QFrame):
         self.status_label.setText(f"{port}  |  {baud}  |  {state}  |  {log}")
     
     def set_window_background_color(self, background_color):
+        self.background_color = background_color
         self.setStyleSheet(f"""
             background-color: {background_color}; 
             border: 1px solid #dcdde1; 
